@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -292,4 +294,82 @@ func fileURLFromPath(path string) string {
 		return "file:///" + path
 	}
 	return "file://" + path
+}
+
+func TestConcurrentReadsSurviveWritesToSameKey(t *testing.T) {
+	const (
+		key          = "pkg/thing-1.0.0.tgz"
+		readers      = 4
+		readsPerRead = 500
+	)
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	b, err := OpenBucket(ctx, fileURLFromPath(dir))
+	if err != nil {
+		t.Fatalf("OpenBucket failed: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+
+	payload := strings.Repeat("x", 4096)
+	if _, _, err := b.Store(ctx, key, strings.NewReader(payload)); err != nil {
+		t.Fatalf("seeding Store failed: %v", err)
+	}
+
+	// The writer reports how it ended: a Store failure would otherwise stop
+	// the writes silently and let zero read failures pass for a test that
+	// never contended anything.
+	done := make(chan struct{})
+	var writers sync.WaitGroup
+	var writes int
+	var writeErr error
+	writers.Add(1)
+	go func() {
+		defer writers.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			if _, _, err := b.Store(ctx, key, strings.NewReader(payload)); err != nil {
+				writeErr = err
+				return
+			}
+			writes++
+		}
+	}()
+
+	var failures atomic.Int64
+	var reading sync.WaitGroup
+	for range readers {
+		reading.Add(1)
+		go func() {
+			defer reading.Done()
+			for range readsPerRead {
+				r, err := b.Open(ctx, key)
+				if err != nil {
+					failures.Add(1)
+					continue
+				}
+				if _, err := io.Copy(io.Discard, r); err != nil {
+					failures.Add(1)
+				}
+				_ = r.Close()
+			}
+		}()
+	}
+	reading.Wait()
+	close(done)
+	writers.Wait()
+
+	if writeErr != nil {
+		t.Fatalf("writer stopped early: %v", writeErr)
+	}
+	if writes == 0 {
+		t.Fatal("no write completed, so the reads were never contended")
+	}
+	// Probe only: main still has the sidecar race, so read failures are
+	// expected here and only logged. The writer's fate is the question.
+	t.Logf("%d of %d reads failed, %d writes completed", failures.Load(), readers*readsPerRead, writes)
 }
